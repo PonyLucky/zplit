@@ -675,7 +675,12 @@ pub const Grid = struct {
     fn reflow(self: *Grid, new_cols: u16, new_rows: u16) !void {
         const alloc = self.allocator;
         const old_vp_rows = self.viewport_rows;
-        const old_cursor_vp_row = self.cursor_row;
+        // How many rows sit hidden above the viewport before the resize.
+        // Preserving it across a reflow is what keeps the viewport anchored:
+        // history is never pulled back in, blank rows are created below the
+        // cursor instead (the reverted-resize bug).
+        const old_vp_start: usize =
+            if (self.rows.items.len > self.viewport_rows) self.rows.items.len - self.viewport_rows else 0;
 
         // Phase 1: Compute cursor's linear position
         // cursor_row is viewport-relative; convert to absolute index
@@ -783,9 +788,27 @@ pub const Grid = struct {
             current_canonical += 1;
         }
 
-        // Phase 5a: drop empty trailing rows that no longer fit.  Never touches
-        // rows at or above the cursor, so live content is preserved.
-        while (self.rows.items.len > new_rows) {
+        // Phase 5: Adjust to the viewport height, keeping the viewport anchored.
+        // vp_start (rows hidden above the viewport) is preserved on width
+        // changes and on vertical expansion; blank rows are appended below the
+        // cursor.  Only when the viewport itself shrinks do we let vp_start grow
+        // (content scrolls up, mirroring resizeHeight).
+        const cursor_abs_new: usize = @intCast(new_cursor_row);
+        var vp_start: usize = old_vp_start;
+        if (new_rows < old_vp_rows) {
+            vp_start = if (self.rows.items.len > new_rows) self.rows.items.len - new_rows else 0;
+        } else if (cursor_abs_new < vp_start) {
+            // Re-wrapping collapsed rows above the cursor; slide the window up
+            // just enough to keep the cursor visible.
+            vp_start = cursor_abs_new;
+        } else if (cursor_abs_new >= vp_start + new_rows) {
+            // Re-wrapping pushed rows above the cursor past the viewport bottom.
+            vp_start = cursor_abs_new + 1 - new_rows;
+        }
+
+        // Drop blank trailing rows that no longer fit (never at or above the
+        // cursor, so live content is preserved).
+        while (self.rows.items.len > vp_start + new_rows) {
             const last = &self.rows.items[self.rows.items.len - 1];
             if (last.contentLen() == 0 and self.rows.items.len - 1 > new_cursor_row) {
                 var removed = self.rows.pop().?;
@@ -795,23 +818,9 @@ pub const Grid = struct {
             }
         }
 
-        // Phase 5b: adjust the viewport height.
-        // On expansion we mirror resizeHeight: blank rows are appended *below*
-        // the cursor so its viewport-relative row is preserved and the extra
-        // lines come out blank, instead of sliding the content down over rows
-        // pulled back from history (the reverted-resize bug).
-        if (new_rows > old_vp_rows) {
-            const target_vp_row: usize = @min(@as(usize, old_cursor_vp_row), @as(usize, new_rows) - 1);
-            const new_cursor_abs: usize = @intCast(new_cursor_row);
-            const pad_above = if (new_cursor_abs >= target_vp_row) new_cursor_abs - target_vp_row else 0;
-            const desired_len = pad_above + @as(usize, new_rows);
-            while (self.rows.items.len < desired_len) {
-                try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
-            }
-        } else {
-            while (self.rows.items.len < new_rows) {
-                try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
-            }
+        // Pad below the cursor so the viewport is completely filled.
+        while (self.rows.items.len < vp_start + new_rows) {
+            try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
         }
 
         // NOTE: an earlier version (commit 0245b9e) post-processed the reflowed
