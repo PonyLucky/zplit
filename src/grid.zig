@@ -274,6 +274,10 @@ pub const Grid = struct {
                 self.cursor_row = @intCast(@max(0, @min(new_row, @as(i32, self.viewport_rows) - 1)));
                 self.cursor_col = 0;
             },
+            .next_line => {
+                self.cursor_col = 0;
+                _ = self.applyEvent(.linefeed);
+            },
             .linefeed => {
                 const bottom = self.effectiveScrollBottom();
                 if (self.cursor_row == bottom) {
@@ -1202,4 +1206,138 @@ test "CSI s / CSI u round-trip the cursor" {
     _ = grid.applyEvent(.cursor_restore);
     try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
     try std.testing.expectEqual(@as(u16, 4), grid.cursor_col);
+}
+
+test "linefeed at scroll region bottom scrolls the region" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+
+    // Fill rows 0..5 with "L0".."L5"
+    var r: u16 = 0;
+    while (r < 6) : (r += 1) {
+        _ = grid.applyEvent(.{ .cursor_row_abs = r });
+        _ = grid.applyEvent(.{ .cursor_col_abs = 0 });
+        _ = grid.applyEvent(.{ .print = 'L' });
+        _ = grid.applyEvent(.{ .print = '0' + r });
+    }
+
+    // Set scroll region rows 1..5 (0-based 0..4)
+    _ = grid.applyEvent(.{ .scroll_region = .{ .top = 0, .bottom = 4 } });
+
+    // Cursor back to region bottom (row 4)
+    _ = grid.applyEvent(.{ .cursor_row_abs = 4 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 0 });
+
+    // Linefeed at the bottom of the region must scroll the region up by one.
+    _ = grid.applyEvent(.linefeed);
+
+    // Row 5 (outside region) keeps its content; row 0 now holds old row 1.
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    // The freed region bottom row is blank.
+    try std.testing.expectEqual(@as(u21, ' '), grid.getCell(4, 0).char);
+}
+
+test "ESC 7 / ESC 8 save and restore the cursor (vis scroll pattern)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    // Six numbered lines, then the vis idiom: set the scroll region, save the
+    // cursor at the region bottom, restore it, and emit a plain newline.  The
+    // newline at the region bottom must scroll the region up.
+    const script = "\x1b[1dL0\r\x1b[2dL1\r\x1b[3dL2\r\x1b[4dL3\r\x1b[5dL4\r\x1b[6dL5\r"
+        ++ "\x1b[1;5r\x1b7\x1b8\x1b[5d\n"
+        ++ "\x1b[1;6r\x1b[5dX";
+    for (script) |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.getCell(4, 0).char);
+}
+
+test "ESC 7 saves and ESC 8 restores an arbitrary cursor position" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    for ("\x1b[3;4H\x1b7\x1b[1;1H\x1b8X") |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_col);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.getCell(2, 3).char);
+}
+
+test "ESC E (next line) moves down and to column 0" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    for ("\x1b[3;5H\x1bE") |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u16, 3), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 0), grid.cursor_col);
+}
+
+test "ESC D (index) scrolls at the scroll-region bottom" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    const script = "\x1b[1dL0\r\x1b[2dL1\r\x1b[3dL2\r\x1b[4dL3\r\x1b[5dL4\r\x1b[6dL5\r\x1b[1;5r\x1b[5d\x1bD";
+    for (script) |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+}
+
+test "parser-driven region scroll at region bottom (vis pattern)" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 6);
+    defer grid.deinit();
+    var parser = vt.Parser.init();
+
+    const script = "\x1b[1dL0\r\x1b[2dL1\r\x1b[3dL2\r\x1b[4dL3\r\x1b[5dL4\r\x1b[6dL5\r"
+        ++ "\x1b[1;5r\x1b7\x1b8\x1b[5d\n"
+        ++ "\x1b[1;6r\x1b[5dX";
+    for (script) |b| {
+        if (parser.feed(b)) |ev| {
+            _ = grid.applyEvent(ev);
+        }
+    }
+
+    // After the LF at the region bottom (row 5, 1-based) the region 1..5 scrolled
+    // up: old row 2 is now at row 1, row 5 is blank, row 6 untouched.
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(5, 0).char);
+    try std.testing.expectEqual(@as(u21, '5'), grid.getCell(5, 1).char);
+    try std.testing.expectEqual(@as(u21, 'L'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, '1'), grid.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'X'), grid.getCell(4, 0).char);
 }

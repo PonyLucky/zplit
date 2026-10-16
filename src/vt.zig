@@ -71,6 +71,7 @@ pub const Event = union(enum) {
     cursor_position_report, // DSR: app requests cursor position (CSI 6n)
     device_attributes_request, // DA1: app requests terminal identity (CSI c / CSI 0c)
     linefeed,
+    next_line, // ESC E: linefeed + carriage return
     carriage_return,
     backspace,
     tab,
@@ -264,6 +265,26 @@ pub const Parser = struct {
                         self.state = .osc_string;
                         self.osc_len = 0;
                         return null;
+                    },
+                    '7' => {
+                        // ESC 7 (DEC SC): save cursor position
+                        self.state = .ground;
+                        return .cursor_save;
+                    },
+                    '8' => {
+                        // ESC 8 (DEC RC): restore cursor position
+                        self.state = .ground;
+                        return .cursor_restore;
+                    },
+                    'D' => {
+                        // Index: move the cursor down one line, scrolling at the margin
+                        self.state = .ground;
+                        return .linefeed;
+                    },
+                    'E' => {
+                        // Next line: Index + carriage return
+                        self.state = .ground;
+                        return .next_line;
                     },
                     'M' => {
                         self.state = .ground;
