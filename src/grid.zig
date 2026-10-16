@@ -62,6 +62,14 @@ pub const Grid = struct {
     scroll_top: u16 = 0,
     scroll_bottom: u16 = 0, // 0 means "viewport_rows - 1" (full screen)
 
+    // Autowrap (DECAWM, CSI ?7h/l) — when false the cursor pins to the last column
+    autowrap: bool = true,
+    // Origin mode (DECOM, CSI ?36h/l) — cursor addressing relative to the region top
+    origin_mode: bool = false,
+    // Saved cursor for CSI s / CSI u (separate from the alt-screen save)
+    save_cursor_row: u16 = 0,
+    save_cursor_col: u16 = 0,
+
     // Alternate screen support
     saved_main_rows: ?[]Row = null,
     saved_cursor_row: u16 = 0,
@@ -172,14 +180,20 @@ pub const Grid = struct {
 
                 // Auto-wrap: if cursor + char width exceeds right margin
                 if (self.cursor_col + w > self.cols) {
-                    self.cursor_col = 0;
-                    self.cursor_row +|= 1;
-                    if (self.cursor_row >= self.viewport_rows) {
-                        self.cursor_row = self.viewport_rows - 1;
-                        self.scrollUp(1);
-                    }
-                    if (self.getRow(self.cursor_row)) |rr| {
-                        rr.is_canonical = false;
+                    if (!self.autowrap) {
+                        // DECAWM off: overwrite the last column in place, cursor stays pinned.
+                        // vis/vim rely on this when writing a full-width status line.
+                        self.cursor_col = self.cols -| 1;
+                    } else {
+                        self.cursor_col = 0;
+                        self.cursor_row +|= 1;
+                        if (self.cursor_row >= self.viewport_rows) {
+                            self.cursor_row = self.viewport_rows - 1;
+                            self.scrollUp(1);
+                        }
+                        if (self.getRow(self.cursor_row)) |rr| {
+                            rr.is_canonical = false;
+                        }
                     }
                 }
                 if (self.getRow(self.cursor_row)) |r| {
@@ -202,10 +216,51 @@ pub const Grid = struct {
                     }
                 }
                 self.cursor_col += w;
+                if (!self.autowrap and self.cursor_col >= self.cols) {
+                    // DECAWM off: the cursor never leaves the last column
+                    self.cursor_col = self.cols -| 1;
+                }
             },
             .cursor_pos => |cp| {
-                self.cursor_row = @min(cp.row, self.viewport_rows -| 1);
-                self.cursor_col = @min(cp.col, self.cols -| 1);
+                if (self.origin_mode) {
+                    // DECOM: coordinates are relative to the scroll-region top
+                    const top = self.effectiveScrollTop();
+                    const bottom = self.effectiveScrollBottom();
+                    self.cursor_row = @min(top +| cp.row, bottom);
+                    self.cursor_col = @min(cp.col, self.cols -| 1);
+                } else {
+                    self.cursor_row = @min(cp.row, self.viewport_rows -| 1);
+                    self.cursor_col = @min(cp.col, self.cols -| 1);
+                }
+            },
+            .cursor_col_abs => |col| {
+                self.cursor_col = @min(col, self.cols -| 1);
+            },
+            .cursor_row_abs => |row| {
+                if (self.origin_mode) {
+                    const top = self.effectiveScrollTop();
+                    const bottom = self.effectiveScrollBottom();
+                    self.cursor_row = @min(top +| row, bottom);
+                } else {
+                    self.cursor_row = @min(row, self.viewport_rows -| 1);
+                }
+            },
+            .cursor_save => {
+                self.save_cursor_row = self.cursor_row;
+                self.save_cursor_col = self.cursor_col;
+            },
+            .cursor_restore => {
+                self.cursor_row = self.save_cursor_row;
+                self.cursor_col = self.save_cursor_col;
+            },
+            .set_autowrap => |on| self.autowrap = on,
+            .set_origin => |on| {
+                self.origin_mode = on;
+                if (on) {
+                    // Enabling DECOM homes the cursor into the region
+                    self.cursor_row = self.effectiveScrollTop();
+                    self.cursor_col = 0;
+                }
             },
             .cursor_move => |cm| {
                 const new_row: i32 = @as(i32, self.cursor_row) + cm.row;
@@ -310,6 +365,20 @@ pub const Grid = struct {
                                 r.is_canonical = true;
                             }
                             self.cursor_row = 0;
+                        }
+                    },
+                    3 => {
+                        // Erase above (exclusive of the cursor cell)
+                        var vp_i: u16 = 0;
+                        while (vp_i < self.cursor_row) : (vp_i += 1) {
+                            if (self.getRow(vp_i)) |r| {
+                                @memset(r.cells, Cell{});
+                            }
+                        }
+                        if (self.getRow(self.cursor_row)) |r| {
+                            const ccol: usize = @intCast(self.cursor_col);
+                            const end = @min(ccol, r.cells.len);
+                            @memset(r.cells[0..end], Cell{});
                         }
                     },
                     else => {},
@@ -470,8 +539,8 @@ pub const Grid = struct {
             .scroll_region => |sr| {
                 self.scroll_top = sr.top;
                 self.scroll_bottom = sr.bottom;
-                // DECSTBM resets cursor to home position
-                self.cursor_row = 0;
+                // DECSTBM resets cursor to home position (region home in DECOM)
+                self.cursor_row = if (self.origin_mode) self.scroll_top else 0;
                 self.cursor_col = 0;
             },
             .set_title => return null, // handled externally
@@ -1087,4 +1156,50 @@ test "reflow preserves content through narrow-wide cycle" {
     try std.testing.expectEqual(@as(u21, 'd'), grid.getCell(0, 10).char);
     // After 'd', rest should be spaces
     try std.testing.expectEqual(@as(u21, ' '), grid.getCell(0, 11).char);
+}
+
+test "autowrap off pins the cursor to the last column" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 10, 3);
+    defer grid.deinit();
+
+    _ = grid.applyEvent(.{ .set_autowrap = false });
+    // Write 13 chars into a 10-column row: everything lands on row 0, the last
+    // column is overwritten instead of wrapping (this is what vis depends on).
+    for ("ABCDEFGHIJKLM") |ch| {
+        _ = grid.applyEvent(.{ .print = ch });
+    }
+    try std.testing.expectEqual(@as(u21, 'A'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'M'), grid.getCell(0, 9).char);
+    try std.testing.expectEqual(@as(u21, ' '), grid.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u16, 9), grid.cursor_col);
+}
+
+test "VPA and HPA move the cursor absolutely" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 20, 5);
+    defer grid.deinit();
+
+    _ = grid.applyEvent(.{ .cursor_row_abs = 3 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 7 });
+    try std.testing.expectEqual(@as(u16, 3), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 7), grid.cursor_col);
+
+    _ = grid.applyEvent(.{ .print = 'x' });
+    try std.testing.expectEqual(@as(u21, 'x'), grid.getCell(3, 7).char);
+}
+
+test "CSI s / CSI u round-trip the cursor" {
+    const allocator = std.testing.allocator;
+    var grid = try Grid.init(allocator, 20, 5);
+    defer grid.deinit();
+
+    _ = grid.applyEvent(.{ .cursor_row_abs = 2 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 4 });
+    _ = grid.applyEvent(.cursor_save);
+    _ = grid.applyEvent(.{ .cursor_row_abs = 0 });
+    _ = grid.applyEvent(.{ .cursor_col_abs = 0 });
+    _ = grid.applyEvent(.cursor_restore);
+    try std.testing.expectEqual(@as(u16, 2), grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 4), grid.cursor_col);
 }
